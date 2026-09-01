@@ -123,6 +123,44 @@ dump.
 **Result:** Still no dump on the latest death (20:36+). This is the key
 unresolved observation — see below.
 
+## Likely root cause: Go async preemption (golang/go#71242)
+
+**Strong lead — matches a known open Go runtime bug.**
+
+[golang/go#71242](https://github.com/golang/go/issues/71242) — "runtime: a
+Windows application launched via Steam sometimes freezes" — describes the
+exact same symptom: a Go Windows app intermittently freezes for 10+ seconds
+(or permanently), during idle, with **all threads stuck** (which is why our
+watchdog never dumps — the whole runtime freezes, not just the main thread).
+
+**Root cause:** Go's *asynchronous preemption* on Windows uses
+`SuspendThread`/`ResumeThread`. A DLL that hooks those APIs (Steam overlay
+`gameoverlayrenderer64.dll`, RGB software like LEDKeeper, etc.) can break them,
+leaving a thread stuck in `ResumeThread` during a GC mark-worker preemption.
+The whole process wedges.
+
+**Why it maps to us:**
+- Same Go version family (1.23)
+- Same shape: Windows GUI app, message pump + goroutines
+- Same symptom: intermittent freeze during idle, no watchdog dump
+- Our logs show `LEDKeeper2.exe` (RGB software) and `steam.exe` as active
+  audio sessions — RGB software is exactly the kind of thing that injects
+  hooks into other processes.
+
+**The fix (workaround):** disable async preemption at build time:
+
+```
+-ldflags="-X=runtime.godebugDefault=asyncpreemptoff=1"
+```
+
+or set `GODEBUG=asyncpreemptoff=1` at runtime. The reporter confirmed this
+eliminates the freeze (10 trials, 10,000 GCs each, zero hangs).
+
+**Status:** applied in v0.1.1. Async preemption is a latency optimization, not
+a correctness feature — disabling it is safe for a tray utility. The upstream
+issue is still open (maintainers point at Valve/Steam as the culprit), but the
+workaround is confirmed.
+
 ## The key unresolved observation
 
 The fast watchdog (fires at ~4–6s of stall) **still produced no dump**. That
