@@ -1,0 +1,12 @@
+Windows Registry Editor Version 5.00
+
+; Captures a full minidump the moment DiscordVolumeToggle.exe hangs,
+; BEFORE Windows kills it. The .dmp file names the exact blocked call.
+;
+; Double-click this file, click Yes to merge, then run the app and
+; reproduce the hang. Dumps land in C:\dumps\DiscordVolumeToggle.exe.*.dmp
+
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\DiscordVolumeToggle.exe]
+"DumpFolder"="C:\\dumps"
+"DumpType"=dword:00000002
+"DumpCount"=dword:0000000a
