@@ -1,0 +1,6 @@
+# Build artifacts
+DiscordVolumeToggle.exe
+*.zip
+
+# Logs
+*.log
