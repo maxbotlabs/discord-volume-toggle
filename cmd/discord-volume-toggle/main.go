@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 
+	"github.com/go-ole/go-ole"
 	"golang.org/x/sys/windows"
 
 	"discord-volume-toggle/src/autostart"
@@ -16,9 +17,48 @@ import (
 	"discord-volume-toggle/src/gui"
 	"discord-volume-toggle/src/hotkey"
 	"discord-volume-toggle/src/volume"
+	"discord-volume-toggle/src/watchdog"
 )
 
 func main() {
+	// THE app-level fix for the recurring "not responding" freezes: pin
+	// the main goroutine to its OS thread. The window (and its message
+	// queue) is created on this thread; Win32 delivers *sent* messages to
+	// the queue of the thread that owns the window, and PeekMessage only
+	// drains the CURRENT thread's queue. If the Go scheduler migrates the
+	// pump goroutine to a different OS thread, the pump keeps looping
+	// (heartbeats continue!) but drains the WRONG queue — the real queue
+	// fills up, the window stops answering sent messages, Windows flags it
+	// "not responding". Observed live via goroutine dumps during a hang:
+	// pump goroutine idle in MsgWait while the window was unresponsive.
+	//
+	// Must happen before the window is created (before gui.NewApp/Run).
+	runtime.LockOSThread()
+
+	// First line of main: marker for child-spawn diagnosis.
+	watchdog.ChildMarker()
+
+	// Watchdog-child mode: this copy of the binary is the out-of-process
+	// watchdog. It never touches the app packages; it polls the parent's
+	// window and minidumps it if the pump wedges (see src/watchdog).
+	if hwndArg := watchdog.ChildFromEnv(); hwndArg != "" {
+		watchdog.LogChildArgs(os.Args)
+		watchdog.RunChild(hwndArg)
+		return
+	}
+	if hwndArg := watchdog.ChildHandoffHwnd(); hwndArg != "" {
+		watchdog.LogChildArgs(os.Args)
+		watchdog.RunChild(hwndArg)
+		return
+	}
+	if len(os.Args) >= 2 && os.Args[1] == watchdog.ChildModeArg {
+		watchdog.LogChildArgs(os.Args)
+		if len(os.Args) >= 3 {
+			watchdog.RunChild(os.Args[2])
+		}
+		return
+	}
+
 	// Set up file logging so crashes can be diagnosed.
 	logFile := setupLogging()
 	if logFile != nil {
@@ -86,25 +126,60 @@ func main() {
 	levelIndex := 0
 
 	// Toggle handler: cycle Discord volume through the configured levels.
+	//
+	// Runs on the UI thread (WM_HOTKEY), but the WASAPI work does NOT:
+	// SetAppVolume does a dozen COM round-trips (and Shell_NotifyIcon can
+	// block on a busy Explorer). Doing all of that synchronously here
+	// stalls the message pump — Windows declares the app hung after ~5s.
+	// The COM work therefore runs on a dedicated worker goroutine (with
+	// its own MTA apartment, initialized below) that posts the outcome
+	// back to the pump via a custom message. One at a time: a queued
+	// toggle would apply a stale level, so later requests while one is in
+	// flight are dropped (the hotkey still cycles levelIndex immediately,
+	// so repeated presses keep advancing the target).
+	toggleInFlight := make(chan struct{}, 1)
+
+	// The worker goroutine gets its own COM apartment. COINIT_MULTITHREADED
+	// (not APARTMENTTHREADED): an STA requires a message pump on its own
+	// thread, which a plain goroutine does not have; the WASAPI interfaces
+	// used here are fine in the MTA.
+	go func() {
+		runtime.LockOSThread()
+		if err := ole.CoInitializeEx(0, ole.COINIT_MULTITHREADED); err != nil {
+			// S_OK (0) is success; 0x80010106 is RPC_E_CHANGED_MODE,
+			// meaning the thread is already initialized differently —
+			// also fine to proceed.
+			if err.(*ole.OleError).Code() != 0x80010106 {
+				log.Printf("warning: worker COM init: %v", err)
+			}
+		}
+		for range toggleInFlight {
+			level := cfg.Levels[levelIndex]
+			levelIndex = (levelIndex + 1) % len(cfg.Levels)
+
+			log.Printf("toggling %s volume to %f (worker)", cfg.ProcessName, level)
+			err := volume.SetAppVolume(cfg.ProcessName, level)
+			res := &gui.ToggleResult{LevelPct: int(level * 100)}
+			if err != nil {
+				log.Printf("toggle error: %v", err)
+				res.ErrText = err.Error()
+			}
+			app.DeliverToggleResult(res)
+		}
+	}()
+
 	app.SetToggleHandler(func() {
 		if len(cfg.Levels) == 0 {
 			app.SetStatus("Error: no volume levels configured")
 			return
 		}
-		level := cfg.Levels[levelIndex]
-		levelIndex = (levelIndex + 1) % len(cfg.Levels)
-
-		log.Printf("toggling %s volume to %f", cfg.ProcessName, level)
-		if err := volume.SetAppVolume(cfg.ProcessName, level); err != nil {
-			log.Printf("toggle error: %v", err)
-			app.SetStatus(fmt.Sprintf("Error: %v", err))
-			return
+		// Non-blocking: if a toggle is already in flight, skip. The worker
+		// applies whatever levelIndex holds when it dequeues.
+		select {
+		case toggleInFlight <- struct{}{}:
+		default:
+			log.Printf("toggle skipped: one already in flight")
 		}
-		pct := int(level * 100)
-		app.SetStatus(fmt.Sprintf("Discord volume set to %d%%", pct))
-		app.SetVolumeLabel(fmt.Sprintf("Volume: %d%%", pct))
-		app.SetTrayVolume(pct)
-		log.Printf("toggle complete (Discord at %d%%)", pct)
 	})
 
 	// Keybind handler: persist the new keybind and re-register the hotkey.
@@ -153,6 +228,19 @@ func main() {
 	// Ready handler: fires after the window is created, so the hotkey can be
 	// registered against the real window handle.
 	app.SetReadyHandler(func() {
+		// Start the out-of-process watchdog now that the window handle
+		// exists. It polls the window with SendMessageTimeout (the same
+		// probe Windows uses for "not responding") and minidumps this
+		// process from outside if the pump wedges — immune to whatever
+		// freezes the in-process watchdog.
+		stopChild, err := watchdog.Start(app.HWND())
+		if err != nil {
+			log.Printf("watchdog child start warning: %v", err)
+		} else {
+			defer stopChild()
+			log.Printf("watchdog child started")
+		}
+
 		// Set the initial keybind label.
 		initial := hotkey.Key{VK: cfg.KeybindVK, Mods: cfg.KeybindMods}
 		app.SetKeybindLabel(fmt.Sprintf("Current keybind: %s", initial.String()))

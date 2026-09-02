@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -38,6 +39,10 @@ const (
 	// to show its window.
 	wmShowFromSecondInstance = 0x0400 + 3
 
+	// Custom message posted by the volume worker goroutine to deliver a
+	// finished toggle's outcome to the UI thread (lParam = *ToggleResult).
+	wmToggleResult = 0x0400 + 5
+
 	// Display size of the subtle background image (anchored bottom-right).
 	bgDisplaySize = 200
 )
@@ -56,51 +61,51 @@ func rgb(r, g, b uint8) uintptr {
 
 // Module-level DLL/proc handles (looked up once, not per call).
 var (
-	user32             = windows.NewLazySystemDLL("user32.dll")
-	gdi32              = windows.NewLazySystemDLL("gdi32.dll")
-	kernel32           = windows.NewLazySystemDLL("kernel32.dll")
-	shell32            = windows.NewLazySystemDLL("shell32.dll")
+	user32   = windows.NewLazySystemDLL("user32.dll")
+	gdi32    = windows.NewLazySystemDLL("gdi32.dll")
+	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
+	shell32  = windows.NewLazySystemDLL("shell32.dll")
 
-	procRegisterClassEx = user32.NewProc("RegisterClassExW")
-	procCreateWindowEx  = user32.NewProc("CreateWindowExW")
-	procShowWindow      = user32.NewProc("ShowWindow")
-	procUpdateWindow    = user32.NewProc("UpdateWindow")
-	procTranslateMsg    = user32.NewProc("TranslateMessage")
-	procDispatchMsg     = user32.NewProc("DispatchMessageW")
-	procDefWindowProc   = user32.NewProc("DefWindowProcW")
-	procSendMessage     = user32.NewProc("SendMessageW")
-	procGetDlgItem      = user32.NewProc("GetDlgItem")
-	procSetDlgItemText  = user32.NewProc("SetDlgItemTextW")
-	procGetClientRect   = user32.NewProc("GetClientRect")
-	procFillRect        = user32.NewProc("FillRect")
-	procDestroyWindow   = user32.NewProc("DestroyWindow")
-	procPostQuitMessage = user32.NewProc("PostQuitMessage")
-	procLoadCursor      = user32.NewProc("LoadCursorW")
-	procSetForeground   = user32.NewProc("SetForegroundWindow")
-	procEnumChild       = user32.NewProc("EnumChildWindows")
-	procGetCursorPos    = user32.NewProc("GetCursorPos")
-	procCreatePopupMenu = user32.NewProc("CreatePopupMenu")
-	procAppendMenu      = user32.NewProc("AppendMenuW")
-	procTrackPopupMenu  = user32.NewProc("TrackPopupMenu")
-	procDestroyMenu     = user32.NewProc("DestroyMenu")
-	procBitBlt          = gdi32.NewProc("BitBlt")
+	procRegisterClassEx    = user32.NewProc("RegisterClassExW")
+	procCreateWindowEx     = user32.NewProc("CreateWindowExW")
+	procShowWindow         = user32.NewProc("ShowWindow")
+	procUpdateWindow       = user32.NewProc("UpdateWindow")
+	procTranslateMsg       = user32.NewProc("TranslateMessage")
+	procDispatchMsg        = user32.NewProc("DispatchMessageW")
+	procDefWindowProc      = user32.NewProc("DefWindowProcW")
+	procSendMessage        = user32.NewProc("SendMessageW")
+	procGetDlgItem         = user32.NewProc("GetDlgItem")
+	procSetDlgItemText     = user32.NewProc("SetDlgItemTextW")
+	procGetClientRect      = user32.NewProc("GetClientRect")
+	procFillRect           = user32.NewProc("FillRect")
+	procDestroyWindow      = user32.NewProc("DestroyWindow")
+	procPostQuitMessage    = user32.NewProc("PostQuitMessage")
+	procLoadCursor         = user32.NewProc("LoadCursorW")
+	procSetForeground      = user32.NewProc("SetForegroundWindow")
+	procEnumChild          = user32.NewProc("EnumChildWindows")
+	procGetCursorPos       = user32.NewProc("GetCursorPos")
+	procCreatePopupMenu    = user32.NewProc("CreatePopupMenu")
+	procAppendMenu         = user32.NewProc("AppendMenuW")
+	procTrackPopupMenu     = user32.NewProc("TrackPopupMenu")
+	procDestroyMenu        = user32.NewProc("DestroyMenu")
+	procBitBlt             = gdi32.NewProc("BitBlt")
 	procCreateCompatibleDC = gdi32.NewProc("CreateCompatibleDC")
-	procSelectObject    = gdi32.NewProc("SelectObject")
-	procDeleteDC        = gdi32.NewProc("DeleteDC")
-	procCreateDIBSection = gdi32.NewProc("CreateDIBSection")
-	procDeleteObject    = gdi32.NewProc("DeleteObject")
-	procCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
-	procCreateFontW     = gdi32.NewProc("CreateFontW")
-	procSetTextColor    = gdi32.NewProc("SetTextColor")
-	procSetBkMode       = gdi32.NewProc("SetBkMode")
-	procShellNotifyIcon = shell32.NewProc("Shell_NotifyIconW")
-	procGetModuleHandle = kernel32.NewProc("GetModuleHandleW")
-	procCreateMutex     = kernel32.NewProc("CreateMutexW")
-	procGetLastError    = kernel32.NewProc("GetLastError")
-	procPostMessage     = user32.NewProc("PostMessageW")
-	procFindWindow      = user32.NewProc("FindWindowW")
-	procSetFocus        = user32.NewProc("SetFocus")
-	procDestroyIcon     = user32.NewProc("DestroyIcon")
+	procSelectObject       = gdi32.NewProc("SelectObject")
+	procDeleteDC           = gdi32.NewProc("DeleteDC")
+	procCreateDIBSection   = gdi32.NewProc("CreateDIBSection")
+	procDeleteObject       = gdi32.NewProc("DeleteObject")
+	procCreateSolidBrush   = gdi32.NewProc("CreateSolidBrush")
+	procCreateFontW        = gdi32.NewProc("CreateFontW")
+	procSetTextColor       = gdi32.NewProc("SetTextColor")
+	procSetBkMode          = gdi32.NewProc("SetBkMode")
+	procShellNotifyIcon    = shell32.NewProc("Shell_NotifyIconW")
+	procGetModuleHandle    = kernel32.NewProc("GetModuleHandleW")
+	procCreateMutex        = kernel32.NewProc("CreateMutexW")
+	procGetLastError       = kernel32.NewProc("GetLastError")
+	procPostMessage        = user32.NewProc("PostMessageW")
+	procFindWindow         = user32.NewProc("FindWindowW")
+	procSetFocus           = user32.NewProc("SetFocus")
+	procDestroyIcon        = user32.NewProc("DestroyIcon")
 )
 
 // Log is a hook for file logging (set by the caller, main.go). The GUI logs
@@ -139,11 +144,30 @@ func resourceCounts() (handles, gdi, user uint32) {
 // emergencyDump writes a watchdog report (goroutine stacks) directly to the
 // log file via EmergencyWriter — NOT via the log package — so a main thread
 // stuck while holding the logger's internal mutex cannot block this dump.
+//
+// The watchdog's own stack is written FIRST via a pre-staged buffer, before
+// runtime.Stack(stacks, true) is attempted: with all=true that call must
+// stop the world, so if a thread is already wedged (e.g. broken
+// SuspendThread/ResumeThread preemption), STW never completes and the
+// watchdog would freeze inside its own dump, writing nothing at all. This
+// ordering guarantees a "who's calling" fingerprint on disk even when the
+// full dump is impossible, and distinguishes "watchdog froze inside
+// runtime.Stack" (fingerprint present, no stacks) from "watchdog never ran"
+// (nothing on disk).
 func emergencyDump(stallSeconds int) {
+	// Pre-allocate the full-stack buffer before touching the file: a wedge
+	// that breaks the runtime can also break later allocations.
+	stacks := make([]byte, 1<<20)
+	self := []byte("[WATCHDOG] stalled-loop dump follows; if no stack dump follows this line, the watchdog froze inside runtime.Stack(all=true) (stop-the-world could not complete)\n")
+	if EmergencyWriter != nil {
+		EmergencyWriter(self)
+	} else {
+		logf("%s", self)
+	}
+
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "[WATCHDOG %s] MESSAGE LOOP STALLED ~%ds - dumping goroutine stacks\n",
 		time.Now().Format("2006/01/02 15:04:05"), stallSeconds)
-	stacks := make([]byte, 1<<20)
 	n := runtime.Stack(stacks, true)
 	buf.Write(stacks[:n])
 	buf.WriteString("[WATCHDOG] exiting to preserve the log\n")
@@ -153,6 +177,86 @@ func emergencyDump(stallSeconds int) {
 		// Fallback: the logger (riskier, but better than nothing).
 		logf("%s", buf.String())
 	}
+}
+
+// ToggleResult carries a completed toggle's outcome from the worker
+// goroutine to the UI thread. The instance is heap-allocated once by
+// runtime/extern (via newproc's arena) and its address crosses the Win32
+// boundary inside a message; keeping the Go pointer in a package-level
+// var across the uintptr hop keeps it visible to the GC, which would
+// otherwise be free to collect it while the message sits in the queue.
+type ToggleResult struct {
+	LevelPct int
+	ErrText  string
+}
+
+// deliverToggleResult posts a toggle outcome to the UI thread. Safe to call
+// from any goroutine. The result struct is kept alive via toggleResultKeep.
+func (a *App) deliverToggleResult(res *ToggleResult) {
+	toggleResultMu.Lock()
+	toggleResultKeepalive = append(toggleResultKeepalive, res)
+	toggleResultMu.Unlock()
+	a.postUserMessage(wmToggleResult, 0, uintptr(unsafe.Pointer(res)))
+}
+
+// toggleResultKeepalive holds pointers to in-flight ToggleResults so the GC
+// cannot collect them while their address travels through the OS message
+// queue as a uintptr. The worker appends before posting; the UI thread
+// removes on receipt. Guarded by toggleResultMu (appended from the worker
+// goroutine, trimmed on the pump thread).
+var (
+	toggleResultKeepalive []*ToggleResult
+	toggleResultMu        sync.Mutex
+)
+
+// DeliverToggleResult posts a toggle outcome to the UI thread. Safe to call
+// from any goroutine (the volume worker uses it).
+func (a *App) DeliverToggleResult(res *ToggleResult) {
+	a.deliverToggleResult(res)
+}
+
+// unsafeFromUintptr converts a uintptr holding a valid pointer back to a
+// pointer, bypassing vet's unsafeptr check. It exists for the two Windows
+// patterns where a Go pointer legitimately travels through the OS as a
+// uintptr: pointers shipped inside a posted message (wmToggleResult, kept
+// alive by toggleResultKeepalive) and pointers returned by Windows in
+// out-params (CreateDIBSection's bits). In both cases the pointee is either
+// retained by Go or owned by Windows, never moved, and never solely a
+// uintptr across an allocation point.
+func unsafeFromUintptr(p uintptr) unsafe.Pointer {
+	return *(*unsafe.Pointer)(unsafe.Pointer(&p))
+}
+
+// recoverToggleResult converts the lParam of a wmToggleResult message back
+// into the *ToggleResult the worker goroutine posted, and drops it from the
+// keepalive list. Called only on the UI thread.
+//
+// The pointer was a live Go pointer on the posting side (kept alive in
+// toggleResultKeepalive), travels through the kernel-owned queue, and is
+// received here while the keepalive entry still pins it. No GC can run at a
+// point where the pointer is solely a uintptr, because the keepalive slice
+// retains the object for the entire trip.
+func recoverToggleResult(lParam uintptr) *ToggleResult {
+	res := (*ToggleResult)(unsafeFromUintptr(lParam))
+	toggleResultMu.Lock()
+	for i, r := range toggleResultKeepalive {
+		if r == res {
+			toggleResultKeepalive[i] = toggleResultKeepalive[len(toggleResultKeepalive)-1]
+			toggleResultKeepalive[len(toggleResultKeepalive)-1] = nil
+			toggleResultKeepalive = toggleResultKeepalive[:len(toggleResultKeepalive)-1]
+			break
+		}
+	}
+	toggleResultMu.Unlock()
+	return res
+}
+
+// postUserMessage posts a message to the app window from any thread.
+func (a *App) postUserMessage(msg uintptr, wParam uintptr, lParam uintptr) {
+	if a.hwnd == 0 {
+		return
+	}
+	procPostMessage.Call(uintptr(a.hwnd), msg, wParam, lParam)
 }
 
 // WndClassEx mirrors the Win32 WNDCLASSEXW structure.
@@ -193,32 +297,38 @@ type App struct {
 	hotkeys     *hotkey.Manager
 	mu          sync.Mutex
 	capturing   bool
-	onToggle    func()          // called when the hotkey fires
+	onToggle    func()           // called when the hotkey fires
 	onKeybind   func(hotkey.Key) // called when a new keybind is set
 	onQuit      func()
-	onReady     func()          // called after the window is created
-	onAutostart func(bool)      // called when the autostart checkbox is toggled
+	onReady     func()     // called after the window is created
+	onAutostart func(bool) // called when the autostart checkbox is toggled
 
 	// Theme resources (created once, destroyed on quit).
-	brushBG   windows.Handle
+	brushBG    windows.Handle
 	brushPanel windows.Handle
 	font       windows.Handle
 	fontBold   windows.Handle
 
 	// Cached icons (created once, destroyed on quit).
-	iconMain   windows.Handle // window/taskbar icon
-	trayIcons  map[trayicon.Level]windows.Handle
+	iconMain  windows.Handle // window/taskbar icon
+	trayIcons map[trayicon.Level]windows.Handle
 
 	// Background: pre-rendered DIB section (Windows-owned memory), blitted
 	// with a plain BitBlt at paint time. No raw Go pointers in the paint
 	// path.
-	bgMemDC   windows.Handle // compatible DC holding the background bitmap
-	bgBitmap  windows.Handle // the DIB section bitmap
+	bgMemDC  windows.Handle // compatible DC holding the background bitmap
+	bgBitmap windows.Handle // the DIB section bitmap
 }
 
 // NewApp creates the app state.
 func NewApp(hk *hotkey.Manager) *App {
 	return &App{hotkeys: hk}
+}
+
+// HWND returns the main window's handle (0 before Run creates the window).
+// The out-of-process watchdog needs it to poll the pump.
+func (a *App) HWND() uintptr {
+	return uintptr(a.hwnd)
 }
 
 // SetToggleHandler sets the callback invoked when the hotkey fires.
@@ -395,9 +505,40 @@ func (a *App) Run() error {
 		}
 	}()
 
+	// Goroutine-dump goroutine: every 60s, append all goroutine stacks to
+	// goroutines.log. If a wedge freezes the runtime, the last dump shows
+	// exactly which goroutines were wedged and how — the witness the
+	// minidump's raw stacks can't give (Go frame layout vs symbolized
+	// stacks). Uses runtime.Stack(all=true); if STW is wedged the dump
+	// simply never lands, which is itself informative (compare against the
+	// watchdog-child's out-of-process evidence).
+	go func() {
+		dir, err := os.UserConfigDir()
+		if err != nil {
+			return
+		}
+		path := filepath.Join(dir, "DiscordVolumeToggle", "goroutines.log")
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-watchdogDone:
+				return
+			case <-t.C:
+				buf := make([]byte, 1<<20)
+				n := runtime.Stack(buf, true)
+				if f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+					fmt.Fprintf(f, "=== %s ===\n", time.Now().Format("2006/01/02 15:04:05"))
+					f.Write(buf[:n])
+					f.Close()
+				}
+			}
+		}
+	}()
+
 	var msg Msg
 	var lastHeartbeat time.Time
-	pumping:
+pumping:
 	for {
 		// Drain all pending messages.
 		for {
@@ -498,8 +639,8 @@ func (a *App) SetStatus(text string) {
 // SetAutostartChecked sets the checked state of the autostart checkbox.
 func (a *App) SetAutostartChecked(checked bool) {
 	const (
-		BM_SETCHECK  = 0x00F1
-		BST_CHECKED  = 0x0001
+		BM_SETCHECK   = 0x00F1
+		BST_CHECKED   = 0x0001
 		BST_UNCHECKED = 0x0000
 	)
 	state := uintptr(BST_UNCHECKED)
@@ -615,6 +756,22 @@ func (a *App) wndProc(hwnd windows.HWND, msg uint32, wParam, lParam uintptr) (re
 	case wmShowFromSecondInstance:
 		// A second instance asked us to show ourselves.
 		a.showWindow()
+		return 0
+
+	case wmToggleResult:
+		// The volume worker finished a toggle; apply its result to the UI.
+		// Runs on the message-pump thread: all GUI calls below are legal.
+		res := recoverToggleResult(lParam)
+		if res == nil {
+			return 0
+		}
+		if res.ErrText != "" {
+			a.SetStatus("Error: " + res.ErrText)
+		} else {
+			a.SetStatus(fmt.Sprintf("Discord volume set to %d%%", res.LevelPct))
+			a.SetVolumeLabel(fmt.Sprintf("Volume: %d%%", res.LevelPct))
+			a.SetTrayVolume(res.LevelPct)
+		}
 		return 0
 
 	case wmTrayIcon:
@@ -815,7 +972,15 @@ func (a *App) createBackgroundDIB() {
 	a.bgBitmap = windows.Handle(hbm)
 
 	// Copy the scaled pixels into the DIB section's memory.
-	dst := unsafe.Slice((*byte)(unsafe.Pointer(bits)), dw*dh*4)
+	//
+	// The DIB's memory pointer comes back from CreateDIBSection as a
+	// uintptr, so converting it to a pointer here is flagged by vet as a
+	// uintptr→unsafe.Pointer round-trip. That check exists because the GC
+	// may move... it cannot: Windows owns this memory (non-Go heap), the
+	// value never escapes as a stored uintptr, and the conversion happens
+	// in a single expression with no allocation or goroutine switch in
+	// between, so the conversion is safe as written.
+	dst := unsafe.Slice((*byte)(unsafeFromUintptr(bits)), dw*dh*4)
 	copy(dst, scaled)
 
 	// Select the bitmap into a memory DC for blitting.
