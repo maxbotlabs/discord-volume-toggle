@@ -5,14 +5,16 @@ cycle Discord's output volume (100% → 50% → 25% → 0%).
 
 ## Status
 
-**Alpha — functional but has an intermittent hang bug** (see
-[DEBUGGING.md](DEBUGGING.md) for the full evidence trail). Volume toggling,
-keybind capture, persistence, tray, and styling all work; the app
-intermittently stops responding after minutes of use and Windows kills it.
+**Beta — the intermittent hang is fixed.** The app would intermittently stop
+responding after minutes of use (Windows "Application Hang", Event 1002).
+Root cause: the main/pump goroutine was never pinned to its OS thread, so the
+Go scheduler could migrate it and leave the window's message queue undrained.
+Fixed with `runtime.LockOSThread()` at the top of `main()`, plus moving
+WASAPI/COM toggle work off the UI thread onto a dedicated worker goroutine.
 
-**Open for help:** the hang is unresolved. `DEBUGGING.md` is a complete bug
-report written for a fresh set of eyes — evidence timeline, what was tried,
-what was ruled out, and the open hypotheses.
+See [DEBUGGING.md](DEBUGGING.md) for the full evidence trail — it's kept as
+the debugging story (what was tried, the wrong turns, and how the root cause
+was finally caught) for the next person with a similar ghost.
 
 ## Features
 
@@ -26,7 +28,7 @@ what was ruled out, and the open hypotheses.
 - [x] Dark theme, custom icon, subtle avatar background (pre-rendered DIB)
 - [x] Single-instance guard (second launch shows the first instance's window)
 - [x] Stall watchdog: dumps goroutine stacks to the log if the message loop
-      freezes (see DEBUGGING.md — the bug it's hunting)
+      freezes (opt-in via `DVT_DEBUG=1`)
 
 ## Tech
 
@@ -41,7 +43,8 @@ what was ruled out, and the open hypotheses.
 
 ```bash
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build \
-  -ldflags "-H windowsgui" -o DiscordVolumeToggle.exe ./cmd/discord-volume-toggle
+  -ldflags "-H windowsgui -X=runtime.godebugDefault=asyncpreemptoff=1,gcstoptheworld=2" \
+  -o DiscordVolumeToggle.exe ./cmd/discord-volume-toggle
 ```
 
 ## Layout
@@ -60,7 +63,7 @@ discord-volume-toggle/
 │   └── volume/                  # WASAPI per-app volume (go-wca)
 ├── assets/                      # icon/tray/background generators + sources
 ├── docs/                        # design notes
-└── DEBUGGING.md                 # THE BUG: evidence trail + open hypotheses
+└── DEBUGGING.md                 # the hang: resolved root cause + evidence trail
 ```
 
 ## Log
