@@ -93,10 +93,10 @@ var (
 	procGetWindowThreadPID = user32.NewProc("GetWindowThreadProcessId")
 	procIsWindow           = user32.NewProc("IsWindow")
 
-	procOpenProcess        = kernel32.NewProc("OpenProcess")
-	procTerminateProcess   = kernel32.NewProc("TerminateProcess")
-	procCloseHandle        = kernel32.NewProc("CloseHandle")
-	procMiniDumpWriteDump  = dbghelp.NewProc("MiniDumpWriteDump")
+	procOpenProcess       = kernel32.NewProc("OpenProcess")
+	procTerminateProcess  = kernel32.NewProc("TerminateProcess")
+	procCloseHandle       = kernel32.NewProc("CloseHandle")
+	procMiniDumpWriteDump = dbghelp.NewProc("MiniDumpWriteDump")
 )
 
 const (
@@ -112,94 +112,6 @@ const (
 	miniDumpWithData = 0x00000040 | 0x00000100
 )
 
-// Start launches the watchdog child for the current process and returns a
-// cleanup function that shuts it down. It is a no-op (with a nil cleanup)
-// if the child cannot be started — the app keeps working without it.
-//
-// NOTE: the parent/child handoff goes through an environment variable, NOT
-// argv. Empirically, a child spawned by this windowsgui parent sees a
-// TRUNCATED os.Args ([exe] only) no matter how the command line is built
-// or which CreateProcessW parameters are used (verified with a first-line
-// marker in the child's main); the same spawn from a console parent passes
-// argv fine. Environment survives reliably in every variant tested.
-func Start(hwnd uintptr) (stop func(), err error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return nil, err
-	}
-
-	// Child discovers the parent window itself by window class (the app is
-	// single-instance), so no argv/env handoff is needed at all: the child
-	// is just re-run with the ChildModeArg... which the GUI parent cannot
-	// reliably pass (see ChildFromEnv note). Instead the child-mode entry
-	// check is: "no DVT single-instance mutex is held by THIS process" +
-	// "DVT_WATCHDOG_CHILD env absent" + explicitly spawned... KISS: the
-	// child IS this same binary run with an empty env marker we CAN pass
-	// reliably: the job object? No. Decision: pass mode via a temp FILE
-	// whose path is the ONLY thing we can't lose: a fixed well-known path
-	// in TEMP containing the hwnd. Race-free enough for a single instance.
-	// Command line carries the mode + hwnd (argv handoff). The child-side
-	// env/handoff-file paths remain as fallbacks.
-	cmdline := windows.StringToUTF16Ptr(
-		fmt.Sprintf(`"%s" %s %d`, exe, ChildModeArg, hwnd))
-
-	const createNoWindow = 0x08000000
-	procCreateProcessW := kernel32.NewProc("CreateProcessW")
-	var si struct {
-		Size                     uint32
-		Reserved                 uintptr // LPWSTR lpReserved — MUST be pointer-sized; a uint32 here shifts the whole block
-		Desktop                  uintptr
-		Title                    uintptr
-		X, Y, XSize, YSize       uint32
-		XCountChars, YCountChars uint32
-		FillAttribute            uint32
-		Flags                    uint32
-		ShowWindow               uint16
-		CBReserved2              uint16
-		LpReserved2              uintptr
-		StdInput                 uintptr
-		StdOutput                uintptr
-		StdError                 uintptr
-	}
-	si.Size = uint32(unsafe.Sizeof(si))
-	var pi struct {
-		Process   uintptr
-		Thread    uintptr
-		Pid       uint32
-		Tid       uint32
-	}
-	ok, _, callErr := procCreateProcessW.Call(
-		0, // lpApplicationName = NULL: parse from cmdline (matches the console-parent spawn that works)
-		uintptr(unsafe.Pointer(cmdline)),
-		0, 0,
-		0, // bInheritHandles = FALSE
-		createNoWindow,
-		0, 0,
-		uintptr(unsafe.Pointer(&si)),
-		uintptr(unsafe.Pointer(&pi)),
-	)
-	if ok == 0 {
-		return nil, fmt.Errorf("CreateProcessW failed: %v", callErr)
-	}
-	logLine("parent spawned child pid=%d", pi.Pid)
-	procCloseHandle.Call(pi.Thread)
-	// Diagnostic goroutine: if the child dies immediately, log its exit
-	// code so we can see how far it got.
-	procWaitForSingleObject := kernel32.NewProc("WaitForSingleObject")
-	procGetExitCodeProcess := kernel32.NewProc("GetExitCodeProcess")
-	go func() {
-		procWaitForSingleObject.Call(pi.Process, 0xFFFFFFFF)
-		var code uint32
-		procGetExitCodeProcess.Call(pi.Process, uintptr(unsafe.Pointer(&code)))
-		logLine("watchdog child exited code=%d", code)
-	}()
-	// Keep pi.Process open: it IS the child handle; close it on stop.
-	return func() {
-		procTerminateProcess.Call(pi.Process, 0)
-		procCloseHandle.Call(pi.Process)
-	}, nil
-}
-
 // ChildFromEnv reports the parent hwnd if this process was launched as a
 // watchdog child (empty string otherwise). Detection order:
 //  1. DVT_WATCHDOG_CHILD env (external invocation path)
@@ -214,42 +126,6 @@ func ChildFromEnv() string {
 		return ""
 	}
 	return os.Getenv(childHwndEnv)
-}
-
-// ChildHandoffHwnd is the argv-less child detection path: if the handoff
-// file exists AND our start time is within a second of its write time, this
-// process is the spawned watchdog child. Returns "" when not the child.
-func ChildHandoffHwnd() string {
-	path := filepath.Join(os.TempDir(), childHandoffFile)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	// Consume immediately: first reader takes it.
-	_ = os.Remove(path)
-	return string(data)
-}
-
-// childHandoffFile is the TEMP-file handoff name.
-const childHandoffFile = "dvt-watchdog-handoff.txt"
-
-// LogChildArgs is a diagnostic hook: logs the child's argv so malformed
-// invocations are visible in the log.
-func LogChildArgs(args []string) {
-	logLine("watchdog child argv: %v", args)
-}
-
-// ChildMarker writes a first-line-of-main marker to a temp file so we can
-// tell whether the child's Go main() runs at all when spawned by the GUI
-// parent (vs dying in runtime init).
-func ChildMarker() {
-	f, err := os.OpenFile(filepath.Join(os.TempDir(), "dvt-child-marker.txt"),
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err == nil {
-		fmt.Fprintf(f, "%s main() reached, args=%v\n",
-			time.Now().Format("15:04:05.000"), os.Args)
-		f.Close()
-	}
 }
 
 // RunChild is the entrypoint for child mode: poll the parent's window until

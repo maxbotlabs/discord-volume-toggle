@@ -245,23 +245,24 @@ world stops for 15–20s — or until Windows kills the app.
 frequent but shorter; the wedge persists regardless — the freeze reproduces
 with the flag verified-in-binary.
 
-### Next-hang witness (already in the build)
+### Next-hang witness (opt-in)
 
-- A background goroutine appends **all goroutine stacks** to
-  `%APPDATA%\DiscordVolumeToggle\goroutines.log` every 60s. The last dump
-  before a freeze (or the one mid-freeze) will show true Go-level G states —
-  naming the exact goroutine holding the scheduler.
+- **`DVT_DEBUG=1`** enables the 60s goroutine snapshot to
+  `%APPDATA%\DiscordVolumeToggle\goroutines.log` (single-slot, truncated each
+  write — never grows) plus the 30s `alive (idle):` heartbeat. **Both are off
+  by default** — shipped builds are quiet. This witness is what cracked the
+  2026-09-01 hang; see "ROOT CAUSE FOUND".
 - WER LocalDumps (`capture-crash-dump.reg`, merge once) captures the
   process when Windows terminates it after the hang — from *outside* the
-  wedged runtime.
+  wedged runtime, no env var needed.
 
 ## How to collect the next hang
 
 1. Merge `capture-crash-dump.reg` (once). Dumps land in `C:\dumps`.
-2. Run the app normally. When it hangs:
+2. If you want goroutine-level evidence too, run with `DVT_DEBUG=1` set.
+   When it hangs:
    - `%APPDATA%\DiscordVolumeToggle\goroutines.log` — last 60s snapshot
      (Go goroutine states),
-   - `%APPDATA%\DiscordVolumeToggle\app.log` — heartbeats stop at the freeze,
    - `C:\dumps\DiscordVolumeToggle.exe.*.dmp` — the OS-level dump.
 
 ## Likely root cause: GC/preemption wedge at mark termination (corrected)

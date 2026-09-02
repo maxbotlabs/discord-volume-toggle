@@ -35,24 +35,15 @@ func main() {
 	// Must happen before the window is created (before gui.NewApp/Run).
 	runtime.LockOSThread()
 
-	// First line of main: marker for child-spawn diagnosis.
-	watchdog.ChildMarker()
-
 	// Watchdog-child mode: this copy of the binary is the out-of-process
 	// watchdog. It never touches the app packages; it polls the parent's
 	// window and minidumps it if the pump wedges (see src/watchdog).
+	// Manual/external invocation only — the app never spawns itself.
 	if hwndArg := watchdog.ChildFromEnv(); hwndArg != "" {
-		watchdog.LogChildArgs(os.Args)
-		watchdog.RunChild(hwndArg)
-		return
-	}
-	if hwndArg := watchdog.ChildHandoffHwnd(); hwndArg != "" {
-		watchdog.LogChildArgs(os.Args)
 		watchdog.RunChild(hwndArg)
 		return
 	}
 	if len(os.Args) >= 2 && os.Args[1] == watchdog.ChildModeArg {
-		watchdog.LogChildArgs(os.Args)
 		if len(os.Args) >= 3 {
 			watchdog.RunChild(os.Args[2])
 		}
@@ -228,18 +219,13 @@ func main() {
 	// Ready handler: fires after the window is created, so the hotkey can be
 	// registered against the real window handle.
 	app.SetReadyHandler(func() {
-		// Start the out-of-process watchdog now that the window handle
-		// exists. It polls the window with SendMessageTimeout (the same
-		// probe Windows uses for "not responding") and minidumps this
-		// process from outside if the pump wedges — immune to whatever
-		// freezes the in-process watchdog.
-		stopChild, err := watchdog.Start(app.HWND())
-		if err != nil {
-			log.Printf("watchdog child start warning: %v", err)
-		} else {
-			defer stopChild()
-			log.Printf("watchdog child started")
-		}
+		// NOTE: no auto-spawned out-of-process watchdog child. The self-spawn
+		// (CreateProcessW from this windowsgui parent) never worked — the child
+		// exited before its own main() ran for reasons never fully pinned down
+		// (see DEBUGGING.md, "watchdog child exited code=0"). For hang evidence
+		// use DVT_DEBUG=1 (goroutine snapshots) and/or WER LocalDumps
+		// (capture-crash-dump.reg). The watchdog package remains for manual/
+		// external invocation via `DiscordVolumeToggle.exe --watchdog-child <hwnd>`.
 
 		// Set the initial keybind label.
 		initial := hotkey.Key{VK: cfg.KeybindVK, Mods: cfg.KeybindMods}

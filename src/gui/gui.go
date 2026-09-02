@@ -505,36 +505,42 @@ func (a *App) Run() error {
 		}
 	}()
 
-	// Goroutine-dump goroutine: every 60s, append all goroutine stacks to
-	// goroutines.log. If a wedge freezes the runtime, the last dump shows
-	// exactly which goroutines were wedged and how — the witness the
-	// minidump's raw stacks can't give (Go frame layout vs symbolized
-	// stacks). Uses runtime.Stack(all=true); if STW is wedged the dump
-	// simply never lands, which is itself informative (compare against the
-	// watchdog-child's out-of-process evidence).
-	go func() {
-		dir, err := os.UserConfigDir()
-		if err != nil {
-			return
-		}
-		path := filepath.Join(dir, "DiscordVolumeToggle", "goroutines.log")
-		t := time.NewTicker(60 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-watchdogDone:
+	// Goroutine-dump goroutine: opt-in via DVT_DEBUG=1. Every 60s, writes
+	// all goroutine stacks to goroutines.log (single slot, truncated each
+	// time — never grows). This is the witness that cracked the 2026-09-01
+	// hang: healthy goroutines + unresponsive window = thread migration.
+	// Off by default; if a freeze happens without it, the in-process
+	// watchdog fingerprint + WER LocalDumps remain the evidence path.
+	debugMode := os.Getenv("DVT_DEBUG") == "1"
+	if debugMode {
+		go func() {
+			dir, err := os.UserConfigDir()
+			if err != nil {
 				return
-			case <-t.C:
-				buf := make([]byte, 1<<20)
-				n := runtime.Stack(buf, true)
-				if f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+			}
+			path := filepath.Join(dir, "DiscordVolumeToggle", "goroutines.log")
+			t := time.NewTicker(60 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-watchdogDone:
+					return
+				case <-t.C:
+					buf := make([]byte, 1<<20)
+					n := runtime.Stack(buf, true)
+					// Truncate (no O_APPEND): the file holds only the most
+					// recent snapshot, so it never inflates.
+					f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+					if err != nil {
+						return
+					}
 					fmt.Fprintf(f, "=== %s ===\n", time.Now().Format("2006/01/02 15:04:05"))
 					f.Write(buf[:n])
 					f.Close()
 				}
 			}
-		}
-	}()
+		}()
+	}
 
 	var msg Msg
 	var lastHeartbeat time.Time
@@ -560,7 +566,8 @@ pumping:
 		atomic.StoreInt64(&loopTick, time.Now().Unix())
 
 		// Periodic heartbeat with resource counts (leak visibility).
-		if time.Since(lastHeartbeat) >= 30*time.Second {
+		// Opt-in via DVT_DEBUG=1: it's diagnostics noise for end users.
+		if debugMode && time.Since(lastHeartbeat) >= 30*time.Second {
 			lastHeartbeat = time.Now()
 			h, g, u := resourceCounts()
 			logf("alive (idle): handles=%d gdi=%d user=%d", h, g, u)
